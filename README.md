@@ -24,6 +24,43 @@ the key differences are documented in
 instead of a long-lived RPC subprocess, and adapter-restart recovery from
 mcode's own session store.
 
+[![GitHub stars](https://img.shields.io/github/stars/qingzhu521/openchamber-mcode-connector?style=flat&labelColor=100F0F&color=66800B)](https://github.com/qingzhu521/openchamber-mcode-connector/stargazers)
+[![License](https://img.shields.io/github/license/qingzhu521/openchamber-mcode-connector?style=flat&labelColor=100F0F&color=205EA6)](./LICENSE)
+[![OpenChamber](https://img.shields.io/badge/OpenChamber-1.24.x-100F0F?style=flat)](https://github.com/openchamber/openchamber)
+
+## Quick start
+
+Needs Node.js 22+ and the `mcode` CLI on PATH (or `OCMC_MCODE_BINARY`).
+
+```bash
+git clone https://github.com/qingzhu521/openchamber-mcode-connector.git
+cd openchamber-mcode-connector
+npm install && npm run build
+
+mkdir -p ~/.config/openchamber-mcode
+printf '{\n  "opencodeBinary": "%s/bin/opencode-mcode"\n}\n' "$PWD" \
+  > ~/.config/openchamber-mcode/settings.json
+
+OPENCHAMBER_DATA_DIR=~/.config/openchamber-mcode openchamber serve --port 57125
+# open http://127.0.0.1:57125
+```
+
+That starts a second OpenChamber instance whose sessions run on mcode, leaving
+your main OpenChamber setup untouched.
+
+## Compatibility
+
+| OpenChamber | Status |
+|---|---|
+| 1.24.x (desktop, API v1) | tested against 1.24.2 |
+| other versions | not tested |
+
+OpenChamber changes which OpenCode API calls it makes between releases. If a
+feature breaks on a newer OpenChamber, run `npm run smoke` to see which part
+failed, then open an issue with the output. See
+[docs/api-surface.md](docs/api-surface.md) for the endpoints this adapter
+implements.
+
 ## Status
 
 **M1 + M2 work**: session create/list/rename/delete, prompt (sync + async),
