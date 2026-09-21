@@ -87,12 +87,16 @@ session model and makes crash recovery nearly free.
    tears down the whole chain — same lifecycle as the built-in opencode
    backend, zero extra processes (verified live).
 2. **Isolated second instance**: a dedicated profile runs a separate
-   `openchamber serve` on its own port (default 57125), started manually or
-   by a supervisor. The one-shot watcher/launcher scripts that used to live
-   in `contrib/` were removed (2026-09-21): their lifecycle only held when
-   OpenChamber was opened through the launcher icon, so a direct app open
-   left the instance down and the UI showed it as unreachable. Lifecycle
-   management moves into the adapter itself (sidecar mode, see plan).
+   `openchamber serve` on its own port (default 57125). Lifecycle is owned by
+   the adapter's sidecar supervisor (`src/sidecar.ts`, opt-in via
+   `OCMC_SIDECAR="port=profileDir,..."`): the adapter starts each instance as
+   a direct `--foreground` child after the serve handshake line and SIGTERMs
+   them on shutdown, so instances live exactly as long as the app-managed
+   adapter — including direct Dock/Spotlight opens. The one-shot
+   watcher/launcher scripts that used to live in `contrib/` were removed
+   (2026-09-21): their lifecycle only held when OpenChamber was opened
+   through the launcher icon, leaving the instance unreachable on direct
+   app opens.
 
 A resident supervisor / LaunchAgent variant was built and tested, then
 dropped: it contradicts the parent-child elegance of the built-in flow.
