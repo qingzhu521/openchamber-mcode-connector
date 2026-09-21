@@ -187,8 +187,25 @@ async function main(): Promise<void> {
   const sessionId = created.body.id;
   await sse.waitFor((e) => e.type === "session.created", 5_000, "session.created");
 
-  const asyncRes = await api<unknown>(url, `/session/${sessionId}/prompt_async`, { method: "POST", body: promptBody("Reply with exactly: MCODE-SMOKE-OK") });
+  // OpenChamber sends a client-generated messageID (optimistic insert) — the
+  // adapter must reuse it and echo the user part, or the UI renders the
+  // message twice (verified against OpenChamber's event-reducer).
+  const CLIENT_MSG_ID = "msg_smokeclientecho0001";
+  const asyncRes = await api<unknown>(url, `/session/${sessionId}/prompt_async`, {
+    method: "POST",
+    body: JSON.stringify({ messageID: CLIENT_MSG_ID, parts: [{ type: "text", text: "Reply with exactly: MCODE-SMOKE-OK" }] }),
+  });
   ok("POST /prompt_async accepted", asyncRes.status === 204, `status ${asyncRes.status}`);
+
+  const userPartEcho = await sse.waitFor(
+    (e) =>
+      e.type === "message.part.updated" &&
+      (e.properties as { part?: { messageID?: string; type?: string } }).part?.messageID === CLIENT_MSG_ID &&
+      (e.properties as { part?: { type?: string } }).part?.type === "text",
+    10_000,
+    "user part echo",
+  );
+  ok("client messageID reused + user part echoed", true, JSON.stringify((userPartEcho.properties as { part: unknown }).part).slice(0, 120));
 
   const deltaEv = await sse.waitFor(
     (e) => e.type === "message.part.updated" && typeof (e.properties as { delta?: string }).delta === "string" && (e.properties as { delta?: string }).delta !== "",
@@ -204,6 +221,7 @@ async function main(): Promise<void> {
   ok("assistant text contains MCODE-SMOKE-OK", answer.includes("MCODE-SMOKE-OK"), answer.slice(0, 120));
   const userStored = (messages1.body ?? []).find((m) => m.info.role === "user");
   ok("user message stored clean (no system-reminder)", userStored !== undefined && !textOf(userStored).includes("system-reminder"), textOf(userStored).slice(0, 80));
+  ok("user message keeps the client messageID", userStored?.info.id === CLIENT_MSG_ID, userStored?.info.id);
 
   // 3. abort mid-run, then prove the session is still usable
   console.log("— abort mid-run + reuse —");
@@ -220,6 +238,45 @@ async function main(): Promise<void> {
 
   const syncRes = await api<OCMessageWithParts>(url, `/session/${sessionId}/message`, { method: "POST", body: promptBody("Reply with exactly: SMOKE-SYNC-OK") });
   ok("POST /message (sync) after abort still works", syncRes.status === 200 && textOf(syncRes.body).includes("SMOKE-SYNC-OK"), textOf(syncRes.body).slice(0, 120));
+
+  // 3.5 tool call round (M2): tool parts stream over SSE and land in messages
+  console.log("— tool call round (real bash tool run) —");
+  const toolRun = await api<OCMessageWithParts>(url, `/session/${sessionId}/message`, {
+    method: "POST",
+    body: promptBody('Use the bash tool to run exactly this command: echo tool-smoke-marker. Then reply with exactly: TOOLS-DONE'),
+  });
+  ok("tool round sync prompt returns", toolRun.status === 200, `status ${toolRun.status}`);
+  const toolSse = sse.all.find(
+    (e) => e.type === "message.part.updated" && (e.properties as { part?: { type?: string } }).part?.type === "tool",
+  );
+  ok("SSE streamed a tool part", toolSse !== undefined);
+
+  const messagesTools = await api<OCMessageWithParts[]>(url, `/session/${sessionId}/message`);
+  const allParts = (messagesTools.body ?? []).flatMap((m) => m.parts);
+  const toolPart = allParts.find((p) => p.type === "tool") as
+    | {
+        type: "tool";
+        tool: string;
+        state: { status: string; input: Record<string, unknown>; output?: string };
+      }
+    | undefined;
+  ok("message list contains a tool part", toolPart !== undefined);
+  ok(
+    "tool part is bash + completed (v2 ToolState)",
+    toolPart !== undefined && toolPart.tool === "bash" && toolPart.state?.status === "completed",
+    JSON.stringify(toolPart)?.slice(0, 240),
+  );
+  ok(
+    "tool part state.input carries the command",
+    toolPart !== undefined && String(toolPart.state?.input?.command ?? "").includes("tool-smoke-marker"),
+    JSON.stringify(toolPart?.state?.input),
+  );
+  ok(
+    "tool part state.output carries the stdout",
+    toolPart !== undefined && (toolPart.state?.output ?? "").includes("tool-smoke-marker"),
+    JSON.stringify(toolPart?.state?.output)?.slice(0, 160),
+  );
+  ok("final text answer after tools", textOf(lastAssistant(messagesTools.body)).includes("TOOLS-DONE"), textOf(lastAssistant(messagesTools.body)).slice(0, 120));
 
   // 4. rename
   const renamed = await api<OCSession>(url, `/session/${sessionId}`, { method: "PATCH", body: JSON.stringify({ title: "smoke-renamed" }) });
@@ -250,8 +307,14 @@ async function main(): Promise<void> {
     await sleep(500);
   }
   ok("history hydrated from mcode messages.jsonl", (hydrated ?? []).length >= 2, `${(hydrated ?? []).length} messages`);
-  const hydratedAnswer = textOf(lastAssistant(hydrated));
-  ok("hydrated history contains both answers", hydratedAnswer.includes("SMOKE-SYNC-OK"), hydratedAnswer.slice(0, 120));
+  // mcode's messages.jsonl persists only text/thinking blocks — tool parts do
+  // not survive restarts (verified 2026-09-21: probe session store contains
+  // no tool blocks). Hydration assertions therefore cover text only.
+  const allAssistantText = (hydrated ?? [])
+    .filter((m) => m.info.role === "assistant")
+    .map((m) => textOf(m))
+    .join("\n");
+  ok("hydrated history contains both answers", allAssistantText.includes("SMOKE-SYNC-OK") && allAssistantText.includes("TOOLS-DONE"), allAssistantText.slice(0, 160));
   const hydratedUser = (hydrated ?? []).find((m) => m.info.role === "user");
   ok("hydrated user text stripped of runtime wrappers", hydratedUser !== undefined && !textOf(hydratedUser).includes("system-reminder"));
 

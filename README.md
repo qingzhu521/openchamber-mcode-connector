@@ -26,11 +26,13 @@ mcode's own session store.
 
 ## Status
 
-**M1 works**: session create/list/rename/delete, prompt (sync + async), live
-text/reasoning streaming over SSE, abort (session stays usable), model catalog
-from mcode, and full restart recovery (sessions and history survive adapter
-restarts via `adapter-state.json` + mcode `messages.jsonl`). See
-[docs/plan.md](docs/plan.md) for the roadmap (tool-call parts are M2).
+**M1 + M2 work**: session create/list/rename/delete, prompt (sync + async),
+live text/reasoning streaming over SSE, **tool call parts** (bash/write/read
+… rendered in OpenChamber with input fields, output text and details,
+completed/error states, abort-safe), abort (session stays usable), model
+catalog from mcode, and full restart recovery (sessions and history survive
+adapter restarts via `adapter-state.json` + mcode `messages.jsonl`). See
+[docs/plan.md](docs/plan.md) for the roadmap (permissions bridge is M3).
 
 ## Recommended: built-in lifecycle (zero extra processes)
 
@@ -52,6 +54,13 @@ Then just open OpenChamber normally (Dock/Spotlight/login) — the backend is
 mcode. Verified: app start → managed server + adapter up; app quit → all
 processes gone. To revert, restore the backup or clear the
 `opencodeBinary` field.
+
+## Keeping opencode as `Local`
+
+This adapter is a single-purpose backend: it only serves mcode. To keep the
+app's `Local` backend as the *real* opencode while isolated mcode/pi profiles
+start and stop with the app, point `opencodeBinary` at the standalone
+[openchamber-sidecars](../openchamber-sidecars) launcher instead.
 
 ## Isolated second instance (optional)
 
@@ -83,41 +92,6 @@ OPENCHAMBER_DATA_DIR=~/.config/openchamber-mcode openchamber serve --port 57125
 
 Requires: Node.js 22+, the `mcode` CLI on PATH (or `OCMC_MCODE_BINARY`).
 
-## Sidecar instance management (optional)
-
-The isolated instances above can ride the adapter's own lifecycle: OpenChamber
-spawns this adapter when the app opens and SIGTERMs the chain when it quits,
-so the adapter can start/stop the instances as direct children — no watchers,
-no launchers, and opening the app directly (Dock/Spotlight) works exactly the
-same as opening it via any launcher.
-
-```bash
-# set in ~/.config/openchamber/settings.json "opencodeBinary" env, or export
-# before OpenChamber starts the managed server:
-OCMC_SIDECAR="57125=$HOME/.config/openchamber-mcode,57124=$HOME/.config/openchamber-pi"
-```
-
-Each entry is `port=profileDir`; ports already answering on `/health` are
-skipped, sidecar failures are logged and never break the adapter, and
-instances log to `/tmp/openchamber-mcode-sidecar-<port>.log`. Requires the
-`openchamber` CLI (resolved from PATH, common user bins, or
-`OCMC_OPENCHAMBER_BIN`).
-
-Because the desktop app spawns the adapter with a minimal GUI environment
-(shell-profile env vars never reach it), the recommended configuration is a
-file — `~/.openchamber-mcode/sidecar.json`:
-
-```json
-[
-  { "port": 57125, "profileDir": "~/.config/openchamber-mcode" },
-  { "port": 57124, "profileDir": "~/.config/openchamber-pi" }
-]
-```
-
-(`~` expands to the home directory; path override via `OCMC_SIDECAR_FILE`.
-The `OCMC_SIDECAR` env var still wins when set, e.g. in tests or terminal
-runs.)
-
 Debug logging: set `OCMC_DEBUG=1` (writes HTTP requests and mcode events to
 `/tmp/openchamber-mcode-debug.log`, override with `OCMC_DEBUG_LOG`).
 
@@ -126,7 +100,7 @@ Debug logging: set `OCMC_DEBUG=1` (writes HTTP requests and mcode events to
 ```bash
 npm install
 npm run build
-npm run smoke   # end-to-end: bootstrap probes, prompt+stream, abort, restart recovery
+npm run smoke   # end-to-end: bootstrap probes, prompt+stream, tool calls, abort, restart recovery
 ```
 
 ## Configuration
@@ -140,10 +114,6 @@ npm run smoke   # end-to-end: bootstrap probes, prompt+stream, abort, restart re
 | `OCMC_EFFORT` | – | pass `--effort` |
 | `OCMC_MAX_STEPS` | – | pass `--max-steps` |
 | `OCMC_TURN_TIMEOUT` | – | pass `--timeout` (e.g. `30m`) |
-| `OCMC_SIDECAR` | – | comma list `port=profileDir`: isolated `openchamber serve` instances to start/stop with the adapter (or config file, see below) |
-| `OCMC_SIDECAR_FILE` | `~/.openchamber-mcode/sidecar.json` | sidecar config file used when `OCMC_SIDECAR` is unset (recommended for the desktop app) |
-| `OCMC_OPENCHAMBER_BIN` | `openchamber` (PATH + common dirs) | openchamber CLI used by the sidecar supervisor |
-| `OCMC_SIDECAR_LOG_DIR` | `/tmp` | directory for `openchamber-mcode-sidecar-<port>.log` files |
 | `OCMC_DEBUG` / `OCMC_DEBUG_LOG` | – / `/tmp/openchamber-mcode-debug.log` | debug logging |
 
 Deleting a session through OpenChamber removes the adapter mapping but never

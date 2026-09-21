@@ -179,7 +179,7 @@ export class AdapterServer {
             .filter((p) => p.type === "text" && typeof p.text === "string")
             .map((p) => p.text!)
             .join("\n");
-          void this.sessions.prompt(sessionId!, text, body.model, body.noReply).catch((err) => {
+          void this.sessions.prompt(sessionId!, text, body.model, body.noReply, body.messageID).catch((err) => {
             console.error(`[prompt_async] session ${sessionId} failed:`, err);
           });
           res.writeHead(204).end();
@@ -191,7 +191,7 @@ export class AdapterServer {
             .filter((p) => p.type === "text" && typeof p.text === "string")
             .map((p) => p.text!)
             .join("\n");
-          await this.sessions.prompt(sessionId!, text, body.model, body.noReply);
+          await this.sessions.prompt(sessionId!, text, body.model, body.noReply, body.messageID);
           const msgs = this.sessions.messages(sessionId!) ?? [];
           const last = msgs[msgs.length - 1] ?? null;
           this.json(res, 200, last);
@@ -201,7 +201,7 @@ export class AdapterServer {
           this.json(res, 200, await this.sessions.abort(sessionId!));
           return;
         default:
-          this.json(res, 501, { name: "NotImplemented", data: { message: `${method} ${path} not implemented (M1)` } });
+          this.json(res, 501, { name: "NotImplemented", data: { message: `${method} ${path} not implemented` } });
           return;
       }
     }

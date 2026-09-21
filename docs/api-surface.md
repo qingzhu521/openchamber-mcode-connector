@@ -4,7 +4,7 @@ Same consumer as openchamber-pi (inventory originally extracted from
 `reference/openchamber`, see the pi repo's `docs/api-surface.md`); this
 document tracks the mcode counterpart for each item.
 
-## REST/SDK methods implemented (M1)
+## REST/SDK methods implemented (M1 + M2)
 
 | SDK method | Purpose in OpenChamber | mcode counterpart |
 |---|---|---|
@@ -13,10 +13,10 @@ document tracks the mcode counterpart for each item.
 | `session.get` | session detail | adapter registry |
 | `session.update` | rename/metadata | adapter-side title |
 | `session.delete` | delete session | kill current run + drop mapping (mcode transcript untouched) |
-| `session.messages` | load message history | live registry; after restart hydrated from `messages.jsonl` |
-| `session.promptAsync` | send prompt (async) | spawn `mcode exec --input - --output-format stream-json` (prompt on stdin) |
-| `session.abort` | stop generation | SIGTERM the exec subprocess |
-| `session.fork` / `revert` / `unrevert` / `summarize` / `todo` / `shell` / `command` / `share` | — | **not implemented (M1)** — 501/404 |
+| `session.messages` | load message history | live registry (incl. tool parts); after restart hydrated from `messages.jsonl` (text/thinking only — mcode does not persist tool calls) |
+| `session.promptAsync` | send prompt (async) | spawn `mcode exec --input - --output-format stream-json` (prompt on stdin). **Echo contract** (verified against OpenChamber's event-reducer): the client sends its optimistic `messageID` in the body — the adapter reuses it for the user message and echoes `message.updated` + `message.part.updated` (user text part), so the optimistic insert reconciles in place instead of rendering twice. |
+| `session.abort` | stop generation | SIGTERM the exec subprocess (dangling tool parts finalize as error) |
+| `session.fork` / `revert` / `unrevert` / `summarize` / `todo` / `shell` / `command` / `share` | — | **not implemented** — 501/404 |
 
 ## Bootstrap probes (must exist, observed live on OpenChamber 1.21.0)
 
@@ -64,6 +64,13 @@ Emitted by this adapter (M1): `server.connected`, `session.created`,
 during streaming — `message.part.delta` frames are not required; OpenChamber
 consumes `message.part.updated` deltas, as verified on the pi adapter).
 
+M2 adds tool parts on `message.part.updated`: `part.type === "tool"` with
+`{callID, tool, state}` where `state` mirrors the SDK v2 `ToolState` union —
+`{status:"pending", input, raw}`, `{status:"running", input, title?, metadata?}`,
+`{status:"completed", input, output: string, title, metadata, time}` or
+`{status:"error", input, error, time}` (shape verified against
+`@opencode-ai/sdk@1.18.31` `dist/v2/gen/types.gen.d.ts`).
+
 ## mcode stream-json → OpenCode event mapping
 
 | mcode event | OpenCode SSE |
@@ -71,7 +78,7 @@ consumes `message.part.updated` deltas, as verified on the pi adapter).
 | (subprocess spawn) | `session.status` busy |
 | `item.*` type `reasoning` (`contentDelta`/`content`) | `message.part.updated` (reasoning part, delta) |
 | `item.*` type `agent_message` | `message.part.updated` (text part, delta) |
-| `item.*` type `tool_call` | (M2) closes current assistant message |
+| `item.*` type `tool_call` | `message.part.updated` (tool part; boundary: next text item closes the assistant message) |
 | `turn.completed` (`model`+`usage`) | `message.updated` (tokens/model) |
 | run settled (`exec.completed` / exit) | `message.updated` (finish) + `session.status` idle + `session.idle` |
 | `*.failed` / error exit without `exec.completed` | `session.error` + idle |

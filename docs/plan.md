@@ -36,10 +36,21 @@ exec.started → session.started | session.resumed → turn.started
   → item.started/item.updated/item.completed   (item.type:
       "reasoning"      {contentDelta} / {content}
       "agent_message"  {contentDelta} / {content}
-      "tool_call"      {toolCall:{id,name,status,input,output}}   ← M2 再映射)
+      "tool_call"      {toolCall:{id,name,status,input,output}}   ← M2 已映射，见下)
   → turn.completed   {model:{providerId,modelId,variant}, usage:{inputTokens,outputTokens,cacheReadTokens,totalTokens}, durationMs}
   → exec.completed   {result:{status:"succeeded"|"cancelled"…, output, model, usage}}
 ```
+
+### tool_call 实测形状（mcode 0.5.0，2026-09-21，探针会话）
+
+- `toolCall.status` 数字枚举：输入流阶段 4/5 → 参数定局 1（带 `input`）→
+  输出定局 2（成功）/ 3（出错，如 read ENOENT）。
+- `input` 是参数对象：bash `{command}`、write `{path, content}`、read `{path}`。
+- `output` 统一为 `{content:[{type:"text",text}], details:{…}}`（write 另有
+  `structuredPreview`，暂不透传）。
+- 一个 turn 内可多个 tool_call 并发（write/read/bash 交错 start、批量 complete）。
+- **`messages.jsonl` 不落盘工具调用**（探针会话只有 text/thinking 块）——重启
+  恢复后工具部分消失，文本/推理保留；这是 mcode 数据源的限制，已注明。
 
 ## 3. 与 openchamber-pi 的架构差异（核心决策）
 
@@ -95,14 +106,17 @@ openchamber-mcode/
 | `turn.started`（spawn 即置） | `session.status` busy |
 | `item.*` type `reasoning`（`contentDelta`/`content`） | `message.part.updated`（reasoning part + delta） |
 | `item.*` type `agent_message` | `message.part.updated`（text part + delta） |
-| `item.*` type `tool_call` | M1 忽略（计数留日志；M2 映射 OC tool part） |
+| `item.*` type `tool_call` | `message.part.updated`（tool part，state 为 SDK v2 ToolState 判别联合：pending{raw}→running{input,title}→completed{output,title,metadata}/error{error}） |
 | `turn.completed`（model+usage） | `message.updated`（tokens/model/finish）+ `session.idle` |
 | `exec.completed` | 兑现同步 prompt 的 Promise；finish 按 result.status 映射 |
 | `turn.failed` / `exec.failed` / 非零退出 | `session.error` + 置 idle |
 | （订阅时） | `server.connected` |
 
-消息簿记对齐 pi 版：prompt 时先落 OC user message；**每 turn 一条** OC assistant
-message（parts = 该 turn 全部 reasoning/text item，按 item.id 稳定关联）。
+消息簿记对齐 pi 版：prompt 时先落 OC user message；每 turn 一条或多条 OC assistant
+message（parts = 该段全部 reasoning/text/tool item，按 item.id 稳定关联）。**工具
+边界规则**：tool part 挂进当前流式 assistant message；工具之后的**新** text/
+reasoning item 先收口当前 message 再开新的——与 mcode 每 API response 落一条
+assistant 记录的粒度一致（实测：text → tools → 新 text）。
 
 ### 模型目录
 
@@ -137,9 +151,13 @@ providerId 原样保留（含冒号，实测 OC 引用结构是 `{providerID, mo
 
 - **M0 计划与调研** —— 本文 + 实测证据。✅
 - **M1 聊天闭环**：会话 CRUD、prompt（同步/异步）、text/reasoning 流式、abort、
-  模型目录、SSE 广播。**含 pi 版没有的重启恢复。**
-- **M2 工具调用**：`tool_call` item → OC tool part（input/output JSON），diff 可见。
+  模型目录、SSE 广播。**含 pi 版没有的重启恢复。** ✅
+- **M2 工具调用**：`tool_call` item → OC tool part（input 逐字段 / output 文本
+  +details / 状态机 pending→running→completed|error；abort 时悬空 tool 收敛为
+  error）。✅（2026-09-21，payload 形状见 §2）
 - **M3 权限/提问桥**：目前 exec 无法 ask（smart/full/off 由 `OCMC_PERMISSION` 透传）。
+  **新线索**：`mcode acp` 可作为 stdio 上的 Agent Client Protocol server——若走
+  ACP 可原生获得权限请求/工具事件，值得作为 M3+ 的后端升级方向评估。
 - **M4 模型切换/统计/压缩**：`--model` 已通，其余看 mcode 后续能力。
 - **M5 打包发布**：npm 包、CI。
 
@@ -165,6 +183,9 @@ providerId 原样保留（含冒号，实测 OC 引用结构是 `{providerID, mo
 - mcode 会话目录按日期分层，靠 manifest 定位（启动时扫一次并缓存；找不到就降级空历史）。
 - `turn.failed`/`exec.failed` 的确切事件名未观测到（ probes 全部成功），按通配
   `*.failed`/`error` 字段防御性处理。
+- `toolCall.status` 枚举只有经验语义：完成态 2=成功、3=出错是实测（bash/write 成功
+  =2、read ENOENT=3），中间态 4/5/1 的命名未知——映射只用"事件类型 + payload
+  存在性 + 完成态 2/3"驱动，不依赖中间态语义。
 - OpenChamber UI 端到端联调留待用户环境验证（本机若装有 openchamber 可直接跑 README 步骤）。
 
 ## 10. 验收标准（本轮）
@@ -175,3 +196,10 @@ providerId 原样保留（含冒号，实测 OC 引用结构是 `{providerID, mo
    `session.idle` → 中止 → 同步 prompt 返回最终消息 → 改名/删除。
 4. 重启适配器后会话列表与消息历史恢复。
 5. 所有新增/修改文件都在 `openchamber-mcode/` 内。
+
+M2 追加验收（2026-09-21）：
+
+6. 冒烟工具轮全绿：SSE 流出 tool part；最终消息列表含 bash tool part
+   （state=completed、input.command、output.stdout 都带 marker）；工具后文本
+   正常回流（TOOLS-DONE）。
+7. 中止路径悬空 tool part 收敛为 error，不留永久 running。

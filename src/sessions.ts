@@ -3,14 +3,14 @@
  * each prompt runs as one `mcode exec` subprocess (process-per-turn — mcode
  * persists session state itself; we re-attach via `--session`).
  *
- * Also owns the mcode stream-json → OpenCode event translation (the M1
- * "event bridge"). Mirrors openchamber-pi's sessions.ts where the contracts
- * coincide.
+ * Also owns the mcode stream-json → OpenCode event translation (the
+ * "event bridge": text/reasoning streaming since M1, tool parts since M2).
+ * Mirrors openchamber-pi's sessions.ts where the contracts coincide.
  */
 
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
-import { McodeExecRun, type McodeStreamEvent, type McodeRunOutcome } from "./mcode-exec.js";
+import { McodeExecRun, type McodeStreamEvent, type McodeRunOutcome, type McodeToolOutput } from "./mcode-exec.js";
 import { Store, type StoredSession } from "./store.js";
 import { McodeSessionIndex, parseHistory } from "./history.js";
 import { defaultModelRef, type Catalog } from "./catalog.js";
@@ -22,9 +22,11 @@ import type {
   OCModelRef,
   OCPart,
   OCPromptBody,
+  OCReasoningPart,
   OCSession,
   OCSessionStatus,
   OCTextPart,
+  OCToolPart,
   OCUserMessage,
 } from "./types.js";
 
@@ -36,8 +38,8 @@ function id(prefix: string): string {
 
 interface StreamingState {
   message: OCAssistantMessage;
-  /** mcode item.id → part; mcode addresses streaming content by stable item id. */
-  partsByItem: Map<string, OCPart>;
+  /** True once a tool part was attached — the next text/reasoning item starts a fresh message. */
+  hasToolParts: boolean;
 }
 
 export interface ManagedSession {
@@ -51,6 +53,13 @@ export interface ManagedSession {
   status: OCSessionStatus;
   model: OCModelRef;
   streaming: StreamingState | undefined;
+  /**
+   * mcode item.id → part for the current turn. Turn-scoped (not message-
+   * scoped): tool parts can outlive the assistant message they live in when
+   * a new text item closes it mid-tool, and their late updates must still
+   * find the same part object.
+   */
+  turnParts: Map<string, OCPart>;
   hydrated: boolean;
 }
 
@@ -93,6 +102,7 @@ export class SessionManager {
         status: { type: "idle" },
         model: stored.model ?? FALLBACK_MODEL,
         streaming: undefined,
+        turnParts: new Map(),
         hydrated: false,
       };
       this.sessions.set(info.id, managed);
@@ -150,6 +160,7 @@ export class SessionManager {
       status: { type: "idle" },
       model,
       streaming: undefined,
+      turnParts: new Map(),
       hydrated: true,
     };
     this.sessions.set(info.id, managed);
@@ -204,14 +215,18 @@ export class SessionManager {
     return true;
   }
 
-  async prompt(sessionId: string, text: string, model?: OCModelRef, noReply = false): Promise<void> {
+  async prompt(sessionId: string, text: string, model?: OCModelRef, noReply = false, messageID?: string): Promise<void> {
     const s = this.sessions.get(sessionId);
     if (!s) throw new Error(`unknown session: ${sessionId}`);
 
     if (model) s.model = model;
 
+    // OpenChamber sends a client-generated messageID with its optimistic
+    // insert; the server MUST reuse it so the echoed message.part.updated /
+    // message.updated events reconcile the optimistic entry in place instead
+    // of rendering the user's message twice (event-reducer matches by id).
     const userMsg: OCUserMessage = {
-      id: id("msg"),
+      id: typeof messageID === "string" && messageID !== "" ? messageID : id("msg"),
       sessionID: s.info.id,
       role: "user",
       time: { created: Date.now() },
@@ -228,6 +243,10 @@ export class SessionManager {
       this.emit(s.info.directory, { type: "session.updated", properties: { info: s.info } });
     }
     this.emit(s.info.directory, { type: "message.updated", properties: { info: userMsg } });
+    // Echo the user text part: the reducer replaces the client's sessionID-less
+    // optimistic part (same type, new id) in place — without this echo a page
+    // fetch merges the optimistic part back in and the text shows twice.
+    for (const p of parts) this.emitPart(s, p);
     this.persist(s);
 
     if (noReply) return; // register-only: record the message, do not run the agent
@@ -246,6 +265,7 @@ export class SessionManager {
     }
 
     this.setStatus(s, { type: "busy" });
+    s.turnParts = new Map(); // fresh item→part index for this turn
     const modelArg =
       s.model.providerID !== FALLBACK_MODEL.providerID
         ? `${s.model.providerID}/${s.model.modelID}`
@@ -280,6 +300,7 @@ export class SessionManager {
       this.persist(s);
     }
 
+    this.finalizeDanglingTools(s, outcome);
     this.finishStreaming(s, outcome);
     this.setStatus(s, { type: "idle" });
     this.emit(s.info.directory, { type: "session.idle", properties: { sessionID: s.info.id } });
@@ -407,26 +428,27 @@ export class SessionManager {
     if (!item) return;
 
     if (item.type === "tool_call") {
-      // M2: map to an OpenCode tool part. For now, a tool boundary closes the
-      // current assistant message so the next text starts a fresh one (this
-      // matches how mcode persists one assistant record per API response, and
-      // therefore how history hydration splits messages).
-      if (s.streaming) {
-        s.streaming.message.time.completed = Date.now();
-        this.emit(s.info.directory, { type: "message.updated", properties: { info: s.streaming.message } });
-        s.streaming = undefined;
-      }
+      this.onToolItem(s, ev);
       return;
     }
 
     if (item.type !== "reasoning" && item.type !== "agent_message") return;
     const kind: "text" | "reasoning" = item.type === "reasoning" ? "reasoning" : "text";
 
-    const streaming = this.ensureStreaming(s);
-    let part = streaming.partsByItem.get(item.id);
-    if (!part) {
+    const existing = s.turnParts.get(item.id);
+    let part: OCTextPart | OCReasoningPart;
+    if (existing !== undefined && isTextPart(existing)) {
+      part = existing;
+    } else if (existing !== undefined) {
+      return; // defensive: item id already mapped to a non-text part
+    } else {
+      // Tool boundary: text/reasoning arriving after tool parts starts a fresh
+      // assistant message — this matches mcode's one-record-per-API-response
+      // persistence granularity (probe 2026-09-21: text → tools → new text).
+      if (s.streaming?.hasToolParts) this.closeStreaming(s);
+      const streaming = this.ensureStreaming(s);
       part = this.newPart(kind, s.info.id, streaming.message.id);
-      streaming.partsByItem.set(item.id, part);
+      s.turnParts.set(item.id, part);
       const record = s.messages.find((m) => m.info.id === streaming.message.id);
       record?.parts.push(part);
       this.emitPart(s, part);
@@ -441,7 +463,113 @@ export class SessionManager {
       this.emitPart(s, part, item.contentDelta);
     }
 
-    this.emit(s.info.directory, { type: "message.updated", properties: { info: streaming.message } });
+    if (s.streaming) {
+      this.emit(s.info.directory, { type: "message.updated", properties: { info: s.streaming.message } });
+    }
+  }
+
+  /**
+   * tool_call items → OpenCode tool parts (M2). The part attaches to the
+   * current streaming assistant message (created when absent, e.g. a
+   * tool-first turn); a *new* text item after tool parts closes that
+   * message. `state` follows @opencode-ai/sdk v2 ToolState (discriminated on
+   * .status; input is a plain record, output is a string, completed carries
+   * title+metadata). Live-observed payload (mcode 0.5.0):
+   *   started/updated  toolCall {id, name, status 4|5}        (input streaming)
+   *   updated          toolCall {..., status 1, input}        (arguments settled)
+   *   updated          toolCall {..., status 2|3, output}     (output settled)
+   *   completed        toolCall {..., status 2|3, input+output}
+   * final status: 2 = success, 3 = error (e.g. ENOENT read).
+   */
+  private onToolItem(s: ManagedSession, ev: McodeStreamEvent): void {
+    const item = ev.item!;
+    const tc = item.toolCall;
+    if (!tc || typeof tc.name !== "string") return;
+
+    let part = s.turnParts.get(item.id) as OCToolPart | undefined;
+    if (!part) {
+      const streaming = this.ensureStreaming(s);
+      part = {
+        id: id("prt"),
+        sessionID: s.info.id,
+        messageID: streaming.message.id,
+        type: "tool",
+        callID: typeof tc.id === "string" && tc.id !== "" ? tc.id : item.id,
+        tool: tc.name,
+        state: { status: "pending", input: {}, raw: "" },
+      };
+      streaming.hasToolParts = true;
+      s.turnParts.set(item.id, part);
+      const record = s.messages.find((m) => m.info.id === streaming.message.id);
+      record?.parts.push(part);
+    }
+
+    const args = (tc.input !== undefined && typeof tc.input === "object" ? tc.input : {}) as Record<string, unknown>;
+    const output = tc.output;
+    const title = toolTitle(tc.name, args);
+    const metadata =
+      output?.details !== undefined && Object.keys(output.details).length > 0
+        ? { details: output.details }
+        : undefined;
+    const startedAt = toolStartedAt(part);
+    const endedAt = Date.now();
+
+    if (ev.type === "item.completed") {
+      if (tc.status === 3) {
+        part.state = {
+          status: "error",
+          input: args,
+          error: toolOutputText(output) ?? `tool ${tc.name} failed (status ${tc.status})`,
+          ...(metadata !== undefined ? { metadata } : {}),
+          time: { start: startedAt, end: endedAt },
+        };
+      } else {
+        part.state = {
+          status: "completed",
+          input: args,
+          output: toolOutputText(output) ?? "",
+          title,
+          metadata: metadata ?? {},
+          time: { start: startedAt, end: endedAt },
+        };
+      }
+    } else if (tc.input !== undefined || tc.output !== undefined) {
+      part.state = {
+        status: "running",
+        input: args,
+        title,
+        ...(metadata !== undefined ? { metadata } : {}),
+        time: { start: startedAt },
+      };
+    } else if (part.state.status === "pending" && ev.type !== "item.started") {
+      part.state = { status: "running", input: args, title, time: { start: startedAt } };
+    }
+
+    this.emitPart(s, part);
+    const owner = s.messages.find((m) => m.info.id === part!.messageID);
+    if (owner) {
+      this.emit(s.info.directory, { type: "message.updated", properties: { info: owner.info } });
+    }
+  }
+
+  /** Tool parts still pending/running when the turn settles never got item.completed. */
+  private finalizeDanglingTools(s: ManagedSession, outcome: McodeRunOutcome): void {
+    for (const part of s.turnParts.values()) {
+      if (part.type !== "tool") continue;
+      if (part.state.status === "completed" || part.state.status === "error") continue;
+      const start = toolStartedAt(part);
+      part.state = outcome.aborted
+        ? { status: "error", input: toolInputOf(part), error: "run aborted", time: { start, end: Date.now() } }
+        : {
+            status: "completed",
+            input: toolInputOf(part),
+            output: "",
+            title: part.tool,
+            metadata: {},
+            time: { start, end: Date.now() },
+          };
+      this.emitPart(s, part);
+    }
   }
 
   private ensureStreaming(s: ManagedSession): StreamingState {
@@ -460,10 +588,18 @@ export class SessionManager {
       cost: 0,
       tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
     };
-    s.streaming = { message: assistant, partsByItem: new Map() };
+    s.streaming = { message: assistant, hasToolParts: false };
     s.messages.push({ info: assistant, parts: [] });
     this.emit(s.info.directory, { type: "message.updated", properties: { info: assistant } });
     return s.streaming;
+  }
+
+  /** Finalize the current streaming assistant message (tool boundary / turn end). */
+  private closeStreaming(s: ManagedSession): void {
+    if (!s.streaming) return;
+    s.streaming.message.time.completed = Date.now();
+    this.emit(s.info.directory, { type: "message.updated", properties: { info: s.streaming.message } });
+    s.streaming = undefined;
   }
 
   private finishStreaming(s: ManagedSession, outcome: McodeRunOutcome): void {
@@ -480,7 +616,7 @@ export class SessionManager {
     s.streaming = undefined;
   }
 
-  private newPart(kind: "text" | "reasoning", sessionID: string, messageID: string): OCPart {
+  private newPart(kind: "text" | "reasoning", sessionID: string, messageID: string): OCTextPart | OCReasoningPart {
     const base = {
       id: id("prt"),
       sessionID,
@@ -504,4 +640,42 @@ export class SessionManager {
       cache: { read: usage.cacheReadTokens ?? 0, write: 0 },
     };
   }
+}
+
+// ---------------------------------------------------------------------
+// tool payload → OpenCode v2 ToolState helpers
+// ---------------------------------------------------------------------
+
+function isTextPart(part: OCPart): part is OCTextPart | OCReasoningPart {
+  return part.type === "text" || part.type === "reasoning";
+}
+
+/** Start timestamp carried by running/completed/error states; pending has none. */
+function toolStartedAt(part: OCToolPart): number {
+  const st = part.state;
+  if (st.status === "running" || st.status === "completed" || st.status === "error") return st.time.start;
+  return Date.now();
+}
+
+function toolInputOf(part: OCToolPart): Record<string, unknown> {
+  return part.state.input ?? {};
+}
+
+/** Human title: `bash: <command>`, `write: <path>`, else the tool name. */
+function toolTitle(tool: string, args: Record<string, unknown>): string {
+  const cmd = typeof args.command === "string" ? args.command : undefined;
+  const path = typeof args.path === "string" ? args.path : undefined;
+  const hint = cmd ?? path;
+  if (hint === undefined) return tool;
+  const short = hint.length > 60 ? `${hint.slice(0, 57)}…` : hint;
+  return `${tool}: ${short}`;
+}
+
+function toolOutputText(output: McodeToolOutput | undefined): string | undefined {
+  if (!output || !Array.isArray(output.content)) return undefined;
+  const text = output.content
+    .filter((b) => typeof b?.text === "string")
+    .map((b) => b.text)
+    .join("");
+  return text === "" ? undefined : text;
 }

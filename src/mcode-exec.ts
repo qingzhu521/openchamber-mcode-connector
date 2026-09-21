@@ -56,13 +56,29 @@ export interface McodeItem {
   contentDelta?: string;
   /** full content (item.completed) */
   content?: string;
+  /**
+   * Tool call payload (item.type === "tool_call"). Live-observed on mcode
+   * 0.5.0 (2026-09-21): status is a numeric enum — input streams in frames
+   * with status 4/5, arguments settle at status 1, the final frame carries
+   * output with status 2 (success) or 3 (error, e.g. an ENOENT read).
+   */
   toolCall?: {
     id: string;
     name: string;
     status: number;
-    input?: unknown;
-    output?: unknown;
+    /** tool arguments, e.g. bash {command}, write {path, content}, read {path} */
+    input?: Record<string, unknown> | undefined;
+    output?: McodeToolOutput | undefined;
+    [key: string]: unknown;
   };
+  [key: string]: unknown;
+}
+
+/** Uniform tool result payload observed across bash/write/read. */
+export interface McodeToolOutput {
+  content?: Array<{ type?: string; text?: string }>;
+  details?: Record<string, unknown>;
+  structuredPreview?: unknown;
   [key: string]: unknown;
 }
 

@@ -13,7 +13,6 @@
  */
 
 import { AdapterServer } from "./server.js";
-import { SidecarSupervisor } from "./sidecar.js";
 
 function arg(name: string, fallback: string): string {
   const argv = process.argv;
@@ -32,7 +31,6 @@ const host = arg("host", arg("hostname", "127.0.0.1"));
 const directory = arg("directory", process.cwd());
 
 const server = new AdapterServer({ port, host, defaultDirectory: directory });
-const sidecar = SidecarSupervisor.fromEnv();
 
 await server.start();
 
@@ -43,14 +41,8 @@ if (serveMode) {
   console.log(`default directory: ${directory}`);
 }
 
-// Sidecars start only after the handshake line so OpenChamber's readiness
-// wait is never delayed (spawn is fire-and-forget and fail-open).
-sidecar?.start();
-
 const shutdown = (): void => {
-  void Promise.allSettled([sidecar ? sidecar.stop() : Promise.resolve(), server.stop()]).then(() =>
-    process.exit(0),
-  );
+  void Promise.allSettled([server.stop()]).then(() => process.exit(0));
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
