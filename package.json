@@ -1,0 +1,24 @@
+{
+  "name": "openchamber-mcode-connector",
+  "version": "0.1.0",
+  "description": "OpenCode-API-compatible adapter that lets OpenChamber drive the mcode (MiniMax Code) agent",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "openchamber-mcode": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "smoke": "tsx contrib/smoke.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "tsx": "^4.23.14",
+    "typescript": "^7.0.2"
+  }
+}
